@@ -1,0 +1,20 @@
+# Market Maker configuration (.env)
+
+MM_ENABLED=true
+MM_PRIVATE_KEY=<key with SATL+WETH+ETH>   # falls back to DEPLOYER_PK if unset
+MM_CHAIN_ID=1
+MM_POOL=0x9208aad8c2e4d1fe7f04aedd5976243692626ee9   # SATL/WETH pool
+MM_FEE=3000                                        # 0.3% pool fee
+MM_RANGE_PCT=2                                     # +/-2% liquidity range
+MM_AMOUNT0_WEI=<amount of token0 in wei>           # SATL (18 dec)
+MM_AMOUNT1_WEI=<amount of token1 in wei>           # WETH (18 dec)
+
+# API endpoints:
+# GET  /api/v1/mm/status    -> pool tick, position, wallet, target range
+# POST /api/v1/mm/mint      -> approve + add concentrated liquidity
+# POST /api/v1/mm/rebalance -> collect + re-mint if price out of range
+# Cron: auto-rebalance every 5 minutes (only when enabled)
+
+# The MM wallet needs: SATL + WETH (for liquidity) + ETH (for gas).
+# Amounts must match the current pool price ratio, otherwise the mint
+# reverts (or you can use amount0Min/amount1Min slippage built-in 5%).

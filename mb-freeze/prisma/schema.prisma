@@ -1,0 +1,178 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+model Market {
+  id              Int      @id @default(autoincrement())
+  marketId        String   @unique
+  chainId         Int
+  dexType         String
+  poolAddress     String
+  token0Address   String
+  token1Address   String
+  baseToken       String   @default("")
+  quoteToken      String   @default("")
+  uniV3Fee        Int?
+  aerodromeStable Boolean  @default(false)
+  sponsor         String
+  metadataUri     String   @default("")
+  status          String   @default("ACTIVE")
+  riskLevel       String   @default("UNKNOWN")
+  riskScore       Int      @default(0)
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@index([chainId, status])
+}
+
+model Token {
+  id              Int      @id @default(autoincrement())
+  chainId         Int
+  address         String
+  symbol          String   @default("")
+  name            String   @default("")
+  decimals        Int      @default(18)
+  totalSupply     String   @default("0")
+  verified        Boolean  @default(false)
+  riskScore       Int      @default(0)
+  riskLevel       String   @default("UNKNOWN")
+  runtimeCodeHash String   @default("")
+  isFork          Boolean  @default(false)
+  forkOfToken     String   @default("")
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  @@unique([chainId, address])
+}
+
+model Pool {
+  id            Int      @id @default(autoincrement())
+  chainId       Int
+  dexType       String
+  poolAddress   String
+  token0Address String
+  token1Address String
+  fee           Int?
+  stable        Boolean  @default(false)
+  liquidityUsd  Float    @default(0)
+  reserve0      String   @default("0")
+  reserve1      String   @default("0")
+  sqrtPriceX96  String   @default("0")
+  tick          Int      @default(0)
+  volume24h     Float    @default(0)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  @@unique([chainId, poolAddress])
+}
+
+model Swap {
+  id             Int      @id @default(autoincrement())
+  chainId        Int
+  dexType        String
+  poolAddress    String
+  txHash         String
+  blockNumber    Int
+  blockTimestamp Int
+  sender         String
+  recipient      String
+  tokenIn        String
+  tokenOut       String
+  amountIn       String
+  amountOut      String
+  price          Float
+  priceUsd       Float    @default(0)
+  side           String
+  createdAt      DateTime @default(now())
+
+  @@index([poolAddress, blockNumber])
+}
+
+model Candle {
+  id         Int      @id @default(autoincrement())
+  marketId   String
+  interval   String
+  openTime   Int
+  open       Float
+  high       Float
+  low        Float
+  close      Float
+  volumeBase Float
+  volumeQuote Float
+  tradeCount Int      @default(0)
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([marketId, interval, openTime])
+}
+
+model RiskReport {
+  id           Int      @id @default(autoincrement())
+  tokenAddress String
+  marketId     String   @default("")
+  score        Int
+  level        String
+  flagsJson    String   @default("[]")
+  detailsJson  String   @default("{}")
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  @@index([tokenAddress])
+}
+
+model ApiUser {
+  id        Int      @id @default(autoincrement())
+  name      String
+  tier      String   @default("STARTUP")
+  satlPaid  Boolean  @default(false)
+  apiKeys   ApiKey[]
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model ApiKey {
+  id        Int      @id @default(autoincrement())
+  key       String   @unique
+  tier      String   @default("STARTUP")
+  active    Boolean  @default(true)
+  userId    Int
+  user      ApiUser  @relation(fields: [userId], references: [id])
+  lastUsed  DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+model MarketFreeze {
+  id              String   @id @default(cuid())
+  marketId        String   @unique
+  chainId         Int
+  reason          String   @default("ORACLE_FEE_UNPAID")
+  amountUsd       Float
+  phase           String   @default("signup")   // signup -> payment
+  status          String   @default("frozen")   // frozen -> active -> expired
+  signupDeadline  DateTime
+  paymentDeadline DateTime?
+  createdAt       DateTime @default(now())
+  updatedAt       DateTime @updatedAt
+
+  contributions Contribution[]
+}
+
+model Contribution {
+  id        String   @id @default(cuid())
+  freezeId  String
+  freeze    MarketFreeze @relation(fields: [freezeId], references: [id])
+  user      String
+  committed Boolean  @default(true)
+  paid      Boolean  @default(false)
+  paidAt    DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([freezeId, user])
+}

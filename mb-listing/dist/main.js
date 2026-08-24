@@ -43,13 +43,16 @@ const swap_controller_1 = __webpack_require__(32);
 const gas_station_service_1 = __webpack_require__(33);
 const gas_station_controller_1 = __webpack_require__(34);
 const mt5_controller_1 = __webpack_require__(35);
+const mm_service_1 = __webpack_require__(36);
+const mm_controller_1 = __webpack_require__(37);
+const agents_controller_1 = __webpack_require__(38);
 let AppModule = class AppModule {
 };
 exports.AppModule = AppModule;
 exports.AppModule = AppModule = __decorate([
     (0, common_1.Module)({
         imports: [schedule_1.ScheduleModule.forRoot()],
-        controllers: [market_controller_1.MarketController, ens_controller_1.EnsController, oracle_controller_1.OracleController, swap_controller_1.SwapController, gas_station_controller_1.GasStationController, mt5_controller_1.Mt5Controller],
+        controllers: [market_controller_1.MarketController, ens_controller_1.EnsController, oracle_controller_1.OracleController, swap_controller_1.SwapController, gas_station_controller_1.GasStationController, mt5_controller_1.Mt5Controller, mm_controller_1.MarketMakerController, agents_controller_1.AgentsController],
         providers: [
             prisma_service_1.PrismaService,
             market_service_1.MarketService,
@@ -66,6 +69,7 @@ exports.AppModule = AppModule = __decorate([
             oracle_feed_service_1.OracleFeedService,
             oracle_service_1.OracleService,
             gas_station_service_1.GasStationService,
+            mm_service_1.MarketMakerService,
         ],
     })
 ], AppModule);
@@ -314,6 +318,11 @@ const KNOWN_DECIMALS = {
     "0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48": 6,
 };
 const UNISWAP_V3_SLOT0 = (0, viem_1.parseAbi)(["function slot0() view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked)"]);
+// Annual listing fee for non-Base chains (Base 8453 is free). Paid listing covers the oracle cost + margin.
+const LISTING_FEES = {
+    1: { amount: 1000, currency: "ETH" }, // Ethereum
+    43114: { amount: 200, currency: "AVAX" }, // Avalanche
+};
 let MarketService = MarketService_1 = class MarketService {
     prisma;
     risk;
@@ -327,6 +336,10 @@ let MarketService = MarketService_1 = class MarketService {
     constructor(prisma, risk) {
         this.prisma = prisma;
         this.risk = risk;
+    }
+    isListingPaid(chainId, address) {
+        const paid = (process.env.LISTING_PAID_TOKENS || "").split(",").map((s) => s.trim()).filter(Boolean);
+        return paid.includes(`${chainId}:${address.toLowerCase()}`);
     }
     onModuleInit() {
         // Seed known tokens
@@ -422,7 +435,8 @@ let MarketService = MarketService_1 = class MarketService {
         return { marketId, lastPrice: "0.0", priceChange24h: "0", high24h: "0.0", low24h: "0.0", volume24hBase: "0", volume24hQuote: "0" };
     }
     async fetchOnchainPrice(poolAddress, market) {
-        if (!this.client)
+        const client = market?.chainId ? (0, chains_2.getClient)(market.chainId) : this.client;
+        if (!client)
             return null;
         const cached = this.priceCache.get(poolAddress);
         if (cached && Date.now() - cached.ts < this.CACHE_TTL)
@@ -430,42 +444,38 @@ let MarketService = MarketService_1 = class MarketService {
         try {
             let slot0;
             try {
-                slot0 = (await this.client.readContract({ address: poolAddress, abi: UNISWAP_V3_SLOT0, functionName: "slot0" }));
+                slot0 = (await client.readContract({ address: poolAddress, abi: UNISWAP_V3_SLOT0, functionName: "slot0" }));
             }
             catch {
-                if (this.baseClient) {
-                    try {
-                        slot0 = (await this.baseClient.readContract({ address: poolAddress, abi: UNISWAP_V3_SLOT0, functionName: "slot0" }));
-                    }
-                    catch {
-                        return null;
-                    }
-                }
-                else {
-                    return null;
-                }
+                return null;
             }
             const sqrtPriceX96 = slot0[0];
             const tick = slot0[1];
-            const Q96 = 2n ** 96n;
             const d0 = market?.token0Decimals || KNOWN_DECIMALS[market?.token0Address?.toLowerCase() || ""] || 18;
             const d1 = market?.token1Decimals || KNOWN_DECIMALS[market?.token1Address?.toLowerCase() || ""] || 18;
-            // price = (sqrtPriceX96 / 2^96)^2 * 10^(d1-d0) in WAD
-            // price(token0/token1) = (sqrtPriceX96/2^96)^2 * 10^(d1-d0)
-            let num = sqrtPriceX96 * sqrtPriceX96 * (10n ** BigInt(18 + d1 - d0));
-            let den = Q96 * Q96;
-            let priceWad = num / den;
-            // If baseToken is token1 (not token0), invert the price
-            const baseIsToken0 = market?.baseToken?.toLowerCase() === market?.token0Address?.toLowerCase();
-            if (baseIsToken0) {
-                // price(token1/token0) = (2^96/sqrt)^2 * 10^(d0-d1)
-                num = Q96 * Q96 * (10n ** BigInt(18 + d0 - d1));
-                den = sqrtPriceX96 * sqrtPriceX96;
-                priceWad = num / den;
+            // Resolve base token address (handles legacy symbol-typed baseToken)
+            let baseAddr = market?.baseToken?.toLowerCase() || "";
+            if (baseAddr && !baseAddr.startsWith("0x")) {
+                const t = await this.prisma.token.findFirst({ where: { chainId: market.chainId, symbol: market.baseToken } });
+                baseAddr = t?.address?.toLowerCase() || baseAddr;
             }
-            const price = (Number(priceWad) / 1e18).toPrecision(8);
-            this.priceCache.set(poolAddress, { price, ts: Date.now() });
-            return { price, sqrtPriceX96: sqrtPriceX96.toString(), tick: tick.toString() };
+            const baseIsToken0 = baseAddr === market?.token0Address?.toLowerCase();
+            // Uniswap V3: tick -> raw token1/token0 = 1.0001^tick
+            const rawPrice = Math.pow(1.0001, tick);
+            let price;
+            if (baseIsToken0) {
+                // base=token0, quote=token1: price = quote/base = token1/token0 (human)
+                price = rawPrice * Math.pow(10, d0 - d1);
+            }
+            else {
+                // base=token1, quote=token0: price = quote/base = token0/token1 (human)
+                price = (1 / rawPrice) * Math.pow(10, d1 - d0);
+            }
+            if (!isFinite(price) || price <= 0)
+                price = 0;
+            const priceStr = price.toPrecision(8);
+            this.priceCache.set(poolAddress, { price: priceStr, ts: Date.now() });
+            return { price: priceStr, sqrtPriceX96: sqrtPriceX96.toString(), tick: tick.toString() };
         }
         catch (err) {
             return null;
@@ -491,6 +501,18 @@ let MarketService = MarketService_1 = class MarketService {
         const cfg = chains_2.ADDRESSES[chainId];
         if (!cfg)
             return { created: false, error: `Unsupported chainId ${chainId}` };
+        // Listing fee: Base (8453) is free; other chains require a paid listing (annual fee covers the oracle)
+        if (chainId !== 8453) {
+            const fee = LISTING_FEES[chainId];
+            if (fee && !this.isListingPaid(chainId, tokenAddress)) {
+                return {
+                    created: false,
+                    error: `Listing on this chain requires an annual fee: $${fee.amount} ${fee.currency}. Pay to the ${fee.currency} wallet, then contact support to activate the listing.`,
+                    listingFee: fee.amount,
+                    feeCurrency: fee.currency,
+                };
+            }
+        }
         // Default quote = WETH of this chain; if quoteToken given, use it
         const quote = (params.quoteToken || cfg.weth).toLowerCase();
         const base = tokenAddress.toLowerCase();
@@ -504,14 +526,25 @@ let MarketService = MarketService_1 = class MarketService {
         const pool = await this.findUniV3Pool(chainId, base, quote);
         if (!pool)
             return { created: false, error: "No Uniswap V3 pool found for this pair", risk: riskLevel };
+        // 2.5 Fetch real token metadata (symbol + decimals) and persist
+        const meta = await this.fetchTokenMeta(chainId, base).catch(() => null);
+        if (meta?.symbol) {
+            await this.prisma.token.upsert({
+                where: { chainId_address: { chainId, address: base } },
+                update: { symbol: meta.symbol, decimals: meta.decimals },
+                create: { chainId, address: base, symbol: meta.symbol, decimals: meta.decimals },
+            }).catch(() => { });
+        }
         // 3. Market ID
-        const baseSymbol = (await this.prisma.token.findUnique({ where: { chainId_address: { chainId, address: base } } }))?.symbol || base.slice(0, 6);
+        const baseSymbol = meta?.symbol || (await this.prisma.token.findUnique({ where: { chainId_address: { chainId, address: base } } }))?.symbol || base.slice(0, 6);
         const chainTag = chainId === 1 ? "ETH" : chainId === 8453 ? "BASE" : chainId === 43114 ? "AVAX" : "CHAIN" + chainId;
         const marketId = `${baseSymbol}-WETH-UNI3-${chainTag}`;
-        // 4. Check existing
-        const existing = await this.prisma.market.findUnique({ where: { marketId } });
+        // 4. Check existing (by marketId OR by pair — protects against legacy hash-ID markets)
+        const existing = await this.prisma.market.findFirst({
+            where: { chainId, baseToken: base, quoteToken: quote },
+        });
         if (existing)
-            return { created: false, marketId, message: "Market already exists" };
+            return { created: false, marketId: existing.marketId, message: "Market already exists" };
         // 5. Uniswap sorts token0 < token1
         const [token0, token1] = base < quote ? [base, quote] : [quote, base];
         // 6. Create market with real pool data
@@ -552,7 +585,7 @@ let MarketService = MarketService_1 = class MarketService {
             return null;
         }
         const abi = (0, viem_1.parseAbi)(["function getPool(address,address,uint24) view returns (address)"]);
-        for (const fee of [100, 500, 3000, 10000]) {
+        for (const fee of [3000, 500, 100, 10000]) {
             try {
                 const addr = await client.readContract({ address: factory, abi, functionName: "getPool", args: [tokenA, tokenB, fee] });
                 if (addr && addr !== "0x0000000000000000000000000000000000000000")
@@ -561,6 +594,23 @@ let MarketService = MarketService_1 = class MarketService {
             catch { /* try next fee tier */ }
         }
         return null;
+    }
+    async fetchTokenMeta(chainId, address) {
+        try {
+            const client = (0, chains_2.getClient)(chainId);
+            const abi = (0, viem_1.parseAbi)([
+                "function symbol() view returns (string)",
+                "function decimals() view returns (uint8)",
+            ]);
+            const [symbol, decimals] = await Promise.all([
+                client.readContract({ address: address, abi, functionName: "symbol" }),
+                client.readContract({ address: address, abi, functionName: "decimals" }),
+            ]);
+            return { symbol: String(symbol), decimals: Number(decimals) };
+        }
+        catch {
+            return null;
+        }
     }
     async getEthUsd() {
         const now = Date.now();
@@ -930,6 +980,7 @@ exports.ADDRESSES = {
         uniV3Factory: "0x1F98431c8aD98523631AE4a59f267346ea31F984",
         uniV3QuoterV2: "0x61fFE014bA17989E743c5F6cB21bF9697530B21e",
         uniV3SwapRouter02: "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45",
+        uniV3PositionManager: "0xC36442b4a4522E871399CD717aBDD847Ab11FE88",
         aerodromeFactory: "0x0000000000000000000000000000000000000000",
         aerodromeRouter: "0x0000000000000000000000000000000000000000",
         weth: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
@@ -939,6 +990,7 @@ exports.ADDRESSES = {
         uniV3Factory: "0x33128a8fC17869897dcE68Ed026d694621f6FDfD",
         uniV3QuoterV2: "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a",
         uniV3SwapRouter02: "0x2626664c2603336E57B271c5C0b26F421741e481",
+        uniV3PositionManager: "0x03a520b32C04BF3bEEf7BEb72E919cf822Ed34f1",
         aerodromeFactory: "0x420DD381b31aEf6683db6B902084cB0FFECe40Da",
         aerodromeRouter: "0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43",
         weth: "0x4200000000000000000000000000000000000006",
@@ -948,6 +1000,7 @@ exports.ADDRESSES = {
         uniV3Factory: "0x740b1c1de25031C31FF4fC9A62f554A55cdC1baD",
         uniV3QuoterV2: "0xbe0F5544EC67Ae09bF8BA979A9f11DaEa0DDE2Ef",
         uniV3SwapRouter02: "0xbb00FF08d01D300023C629E8fFfFcb65A5a578cE",
+        uniV3PositionManager: "0x655C406EBFa14EE2006250925e54ec43AD184f8B",
         aerodromeFactory: "",
         aerodromeRouter: "",
         weth: "0xB31f66AA3C1e785363F0875A1B74E27b85FD66c7",
@@ -957,6 +1010,7 @@ exports.ADDRESSES = {
         uniV3Factory: "0x4752ba5DBc23f44D87826276BF6Fd6b1C372aD24",
         uniV3QuoterV2: "0x3d4e44Eb1374240CE5F1B871ab261CD16335B76a",
         uniV3SwapRouter02: "0x2626664c2603336E57B271c5C0b26F421741e481",
+        uniV3PositionManager: "0x03a520b32C04BF3bEEf7BEb72E919cf822Ed34f1",
         aerodromeFactory: "0x420DD381b31aEf6683db6B902084cB0FFECe40Da",
         aerodromeRouter: "0xcF77a3Ba9A5CA399B7c97c74d54e5b1Beb874E43",
         weth: "0x4200000000000000000000000000000000000006",
@@ -2290,6 +2344,9 @@ let OracleFeedService = OracleFeedService_1 = class OracleFeedService {
     failedCount = 0;
     consecutiveFailures = 0;
     lastRun = 0;
+    lastPrices = new Map();
+    chainId = 1;
+    PRICE_CHANGE_THRESHOLD = 0.002; // 0.2%
     constructor(marketService, prisma) {
         this.marketService = marketService;
         this.prisma = prisma;
@@ -2299,12 +2356,13 @@ let OracleFeedService = OracleFeedService_1 = class OracleFeedService {
         const rpc = process.env.ORACLE_RPC_URL;
         const addr = process.env.ORACLE_CONTRACT_ADDRESS;
         const chainId = parseInt(process.env.ORACLE_CHAIN_ID || "1");
+        this.chainId = chainId;
         const enabledFlag = process.env.ORACLE_ENABLED !== "false";
         if (!pk || !addr) {
             this.logger.warn("Oracle not configured — set ORACLE_FEEDER_PRIVATE_KEY and ORACLE_CONTRACT_ADDRESS in .env");
             return;
         }
-        const chain = chainId === 11155111 ? chains_1.sepolia : chains_1.mainnet;
+        const chain = chainId === 8453 ? chains_1.base : chainId === 84532 ? chains_1.baseSepolia : chainId === 11155111 ? chains_1.sepolia : chains_1.mainnet;
         const account = (0, accounts_1.privateKeyToAccount)(pk.startsWith("0x") ? pk : `0x${pk}`);
         this.publicClient = (0, viem_1.createPublicClient)({
             chain,
@@ -2322,7 +2380,7 @@ let OracleFeedService = OracleFeedService_1 = class OracleFeedService {
             this.logger.warn("Oracle is DISABLED — set ORACLE_ENABLED=true to activate");
     }
     // ---------------------------------------------------------------
-    // Cron — every 60 seconds
+    // Cron — every 5 minutes
     // ---------------------------------------------------------------
     async pushPrices() {
         if (!this.enabled || !this.wallet || !this.oracleAddress || !this.publicClient)
@@ -2334,8 +2392,20 @@ let OracleFeedService = OracleFeedService_1 = class OracleFeedService {
             const entries = await this.collectPrices();
             if (entries.length === 0)
                 return;
-            const ids = entries.map(e => e.marketId);
-            const prices = entries.map(e => e.price);
+            // Push only prices that changed significantly (saves gas)
+            const changed = entries.filter(e => {
+                const last = this.lastPrices.get(e.marketId);
+                if (last === undefined)
+                    return true;
+                if (last === 0n)
+                    return true;
+                const delta = e.price > last ? e.price - last : last - e.price;
+                return Number(delta) / Number(last) > this.PRICE_CHANGE_THRESHOLD;
+            });
+            if (changed.length === 0)
+                return;
+            const ids = changed.map(e => e.marketId);
+            const prices = changed.map(e => e.price);
             this.logger.debug(`Pushing ${ids.length} prices to oracle...`);
             let lastHash = "";
             for (let i = 0; i < ids.length; i++) {
@@ -2358,6 +2428,8 @@ let OracleFeedService = OracleFeedService_1 = class OracleFeedService {
             }
             this.logger.log(`Oracle updated — ${ids.length} prices, tx: ${lastHash.slice(0, 14)}...`);
             this.consecutiveFailures = 0;
+            for (const e of changed)
+                this.lastPrices.set(e.marketId, e.price);
         }
         catch (err) {
             this.consecutiveFailures++;
@@ -2376,6 +2448,8 @@ let OracleFeedService = OracleFeedService_1 = class OracleFeedService {
         const result = await this.marketService.list({ limit: 500 });
         const entries = [];
         for (const market of result.items) {
+            if (market.chainId !== this.chainId)
+                continue; // only push markets on the oracle's chain
             try {
                 const ticker = await this.marketService.getTicker(market.marketId);
                 if (!ticker || ticker.lastPrice === "0.0")
@@ -2460,7 +2534,7 @@ let OracleFeedService = OracleFeedService_1 = class OracleFeedService {
 };
 exports.OracleFeedService = OracleFeedService;
 __decorate([
-    (0, schedule_1.Cron)("*/60 * * * * *"),
+    (0, schedule_1.Cron)("*/300 * * * * *"),
     __metadata("design:type", Function),
     __metadata("design:paramtypes", []),
     __metadata("design:returntype", Promise)
@@ -2743,10 +2817,10 @@ let GasStationService = GasStationService_1 = class GasStationService {
         const usdVolume = 0; // stub — will track real swap volumes
         const tiers = [
             { name: "Free", min: 0, feeBps: 0 },
-            { name: "Basic", min: 1000, feeBps: 5 },
-            { name: "Standard", min: 10000, feeBps: 10 },
-            { name: "Pro", min: 100000, feeBps: 15 },
-            { name: "Enterprise", min: 1000000, feeBps: 20 },
+            { name: "Basic", min: 50, feeBps: 5 },
+            { name: "Standard", min: 1000, feeBps: 10 },
+            { name: "Pro", min: 5000, feeBps: 5 },
+            { name: "Corporate", min: 10000, feeBps: 1 },
         ];
         let tier = tiers[0];
         for (const t of tiers) {
@@ -2951,6 +3025,401 @@ __decorate([
 exports.Mt5Controller = Mt5Controller = __decorate([
     (0, common_1.Controller)("api/v1/mt5")
 ], Mt5Controller);
+
+
+/***/ }),
+/* 36 */
+/***/ (function(__unused_webpack_module, exports, __webpack_require__) {
+
+
+var __decorate = (this && this.__decorate) || function (decorators, target, key, desc) {
+    var c = arguments.length, r = c < 3 ? target : desc === null ? desc = Object.getOwnPropertyDescriptor(target, key) : desc, d;
+    if (typeof Reflect === "object" && typeof Reflect.decorate === "function") r = Reflect.decorate(decorators, target, key, desc);
+    else for (var i = decorators.length - 1; i >= 0; i--) if (d = decorators[i]) r = (c < 3 ? d(r) : c > 3 ? d(target, key, r) : d(target, key)) || r;
+    return c > 3 && r && Object.defineProperty(target, key, r), r;
+};
+var __metadata = (this && this.__metadata) || function (k, v) {
+    if (typeof Reflect === "object" && typeof Reflect.metadata === "function") return Reflect.metadata(k, v);
+};
+var MarketMakerService_1;
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.MarketMakerService = void 0;
+const common_1 = __webpack_require__(3);
+const schedule_1 = __webpack_require__(4);
+const viem_1 = __webpack_require__(9);
+const accounts_1 = __webpack_require__(30);
+const chains_1 = __webpack_require__(10);
+const chains_2 = __webpack_require__(13);
+const NFPM_ABI = (0, viem_1.parseAbi)([
+    "function mint((address token0, address token1, uint24 fee, int24 tickLower, int24 tickUpper, uint256 amount0Desired, uint256 amount1Desired, uint256 amount0Min, uint256 amount1Min, address recipient, uint256 deadline)) returns (uint256 tokenId, uint128 liquidity, uint256 amount0, uint256 amount1)",
+    "function increaseLiquidity((uint256 tokenId, uint256 amount0Desired, uint256 amount1Desired, uint256 amount0Min, uint256 amount1Min, uint256 deadline)) returns (uint128 liquidity, uint256 amount0, uint256 amount1)",
+    "function decreaseLiquidity((uint256 tokenId, uint128 liquidity, uint256 amount0Min, uint256 amount1Min, uint256 deadline)) returns (uint256 amount0, uint256 amount1)",
+    "function collect((uint256 tokenId, address recipient, uint128 amount0Max, uint128 amount1Max)) returns (uint256 amount0, uint256 amount1)",
+    "function positions(uint256 tokenId) returns (uint96 nonce, address operator, address token0, address token1, uint24 fee, int24 tickLower, int24 tickUpper, uint128 liquidity, uint256 feeGrowthInside0LastX128, uint256 feeGrowthInside1LastX128, uint128 tokensOwed0, uint128 tokensOwed1)",
+    "function balanceOf(address owner) returns (uint256)",
+    "function tokenOfOwnerByIndex(address owner, uint256 index) returns (uint256)",
+]);
+const POOL_ABI = (0, viem_1.parseAbi)([
+    "function slot0() view returns (uint160 sqrtPriceX96, int24 tick, uint16 observationIndex, uint16 observationCardinality, uint16 observationCardinalityNext, uint8 feeProtocol, bool unlocked)",
+    "function token0() view returns (address)",
+    "function token1() view returns (address)",
+]);
+const ERC20_ABI = (0, viem_1.parseAbi)([
+    "function approve(address spender, uint256 amount) returns (bool)",
+    "function allowance(address owner, address spender) view returns (uint256)",
+    "function balanceOf(address) view returns (uint256)",
+    "function decimals() view returns (uint8)",
+]);
+const CHAINS = { 1: chains_1.mainnet, 8453: chains_1.base, 43114: chains_1.avalanche };
+let MarketMakerService = MarketMakerService_1 = class MarketMakerService {
+    logger = new common_1.Logger(MarketMakerService_1.name);
+    account = null;
+    wallet = null;
+    publicClient = null;
+    poolAddress = "";
+    chainId = 1;
+    fee = 3000;
+    rangeTicks = 200;
+    amount0 = 0n;
+    amount1 = 0n;
+    enabled = false;
+    lastRun = 0;
+    constructor() {
+        const pk = process.env.MM_PRIVATE_KEY || process.env.DEPLOYER_PK || "";
+        if (!pk)
+            return;
+        try {
+            this.account = (0, accounts_1.privateKeyToAccount)(pk.startsWith("0x") ? pk : `0x${pk}`);
+        }
+        catch {
+            this.account = null;
+        }
+        this.chainId = parseInt(process.env.MM_CHAIN_ID || "1");
+        this.poolAddress = (process.env.MM_POOL || "").toLowerCase();
+        this.fee = parseInt(process.env.MM_FEE || "3000");
+        this.rangeTicks = parseInt(process.env.MM_RANGE_PCT || "2") * 100;
+        this.amount0 = BigInt(process.env.MM_AMOUNT0_WEI || "0");
+        this.amount1 = BigInt(process.env.MM_AMOUNT1_WEI || "0");
+        this.enabled = process.env.MM_ENABLED === "true";
+        const rpc = process.env[`RPC_${this.chainId}`];
+        const chain = CHAINS[this.chainId];
+        if (!this.account || !this.poolAddress || !rpc || !chain) {
+            this.enabled = false;
+            if (process.env.MM_ENABLED === "true") {
+                this.logger.warn("Market maker configured but missing MM_POOL / RPC / private key");
+            }
+            return;
+        }
+        this.publicClient = (0, viem_1.createPublicClient)({ chain, transport: (0, viem_1.http)(rpc) });
+        this.wallet = (0, viem_1.createWalletClient)({ chain, transport: (0, viem_1.http)(rpc), account: this.account });
+    }
+    // ======================= Status =======================
+    async status() {
+        if (!this.publicClient || !this.poolAddress)
+            return { enabled: false, reason: "not configured" };
+        try {
+            const slot0 = await this.publicClient.readContract({
+                address: this.poolAddress, abi: POOL_ABI, functionName: "slot0",
+            });
+            const tick = slot0[1];
+            const ts = Math.floor(this.fee / 50);
+            const pos = await this.getOwnedPosition();
+            return {
+                enabled: this.enabled,
+                chainId: this.chainId,
+                pool: this.poolAddress,
+                fee: this.fee,
+                tick,
+                tickSpacing: ts,
+                rangePct: this.rangeTicks / 100,
+                targetLower: Math.floor((tick - this.rangeTicks) / ts) * ts,
+                targetUpper: Math.floor((tick + this.rangeTicks) / ts) * ts,
+                wallet: this.account?.address,
+                position: pos,
+                configuredAmounts: { amount0: this.amount0.toString(), amount1: this.amount1.toString() },
+            };
+        }
+        catch (e) {
+            return { enabled: this.enabled, error: e?.message || String(e) };
+        }
+    }
+    async getOwnedPosition() {
+        if (!this.wallet)
+            return null;
+        try {
+            const pm = chains_2.ADDRESSES[this.chainId]?.uniV3PositionManager;
+            if (!pm)
+                return null;
+            const count = await this.publicClient.readContract({
+                address: pm, abi: NFPM_ABI, functionName: "balanceOf", args: [this.account.address],
+            });
+            if (count === 0n)
+                return null;
+            const tokenId = await this.publicClient.readContract({
+                address: pm, abi: NFPM_ABI, functionName: "tokenOfOwnerByIndex", args: [this.account.address, count - 1n],
+            });
+            const pos = await this.publicClient.readContract({
+                address: pm, abi: NFPM_ABI, functionName: "positions", args: [tokenId],
+            });
+            return {
+                tokenId: tokenId.toString(),
+                token0: pos[2], token1: pos[3], fee: pos[4],
+                tickLower: pos[5], tickUpper: pos[6],
+                liquidity: pos[7].toString(),
+                tokensOwed0: pos[10].toString(), tokensOwed1: pos[11].toString(),
+            };
+        }
+        catch (e) {
+            return { error: e?.message || String(e) };
+        }
+    }
+    // ======================= Mint =======================
+    async mint() {
+        if (!this.enabled || !this.wallet)
+            return { ok: false, error: "MM disabled or not configured" };
+        const pm = chains_2.ADDRESSES[this.chainId]?.uniV3PositionManager;
+        if (!pm)
+            return { ok: false, error: "No position manager for chain" };
+        try {
+            const slot0 = await this.publicClient.readContract({
+                address: this.poolAddress, abi: POOL_ABI, functionName: "slot0",
+            });
+            const tick = slot0[1];
+            const ts = Math.floor(this.fee / 50);
+            const tickLower = Math.floor((tick - this.rangeTicks) / ts) * ts;
+            const tickUpper = Math.floor((tick + this.rangeTicks) / ts) * ts;
+            const t0 = await this.publicClient.readContract({ address: this.poolAddress, abi: POOL_ABI, functionName: "token0" });
+            const t1 = await this.publicClient.readContract({ address: this.poolAddress, abi: POOL_ABI, functionName: "token1" });
+            if (this.amount0 > 0n)
+                await this.ensureApprove(t0, pm, this.amount0);
+            if (this.amount1 > 0n)
+                await this.ensureApprove(t1, pm, this.amount1);
+            const deadline = BigInt(Math.floor(Date.now() / 1000) + 600);
+            const hash = await this.wallet.writeContract({
+                address: pm,
+                abi: NFPM_ABI,
+                functionName: "mint",
+                args: [{
+                        token0: t0, token1: t1, fee: this.fee,
+                        tickLower, tickUpper,
+                        amount0Desired: this.amount0, amount1Desired: this.amount1,
+                        amount0Min: (this.amount0 * 50n) / 100n, amount1Min: (this.amount1 * 50n) / 100n,
+                        recipient: this.account.address, deadline,
+                    }],
+            });
+            return { ok: true, hash, tickLower, tickUpper, tick, token0: t0, token1: t1 };
+        }
+        catch (e) {
+            const msg = e?.shortMessage || e?.message || String(e);
+            this.logger.error("MM mint failed: " + msg);
+            return { ok: false, error: msg };
+        }
+    }
+    async ensureApprove(token, spender, amount) {
+        const current = await this.publicClient.readContract({
+            address: token, abi: ERC20_ABI, functionName: "allowance", args: [this.account.address, spender],
+        });
+        if (current >= amount)
+            return;
+        await this.wallet.writeContract({
+            address: token, abi: ERC20_ABI, functionName: "approve", args: [spender, amount],
+        });
+    }
+    // ======================= Rebalance =======================
+    async rebalance() {
+        if (!this.enabled || !this.wallet)
+            return { ok: false, error: "MM disabled" };
+        const pos = await this.getOwnedPosition();
+        if (!pos || pos.error)
+            return this.mint();
+        try {
+            const slot0 = await this.publicClient.readContract({
+                address: this.poolAddress, abi: POOL_ABI, functionName: "slot0",
+            });
+            const tick = slot0[1];
+            const buffer = Math.floor(this.rangeTicks / 4);
+            const inRange = tick >= Number(pos.tickLower) + buffer && tick <= Number(pos.tickUpper) - buffer;
+            if (inRange) {
+                return { ok: true, rebalanced: false, tick, reason: "in range", tickLower: pos.tickLower, tickUpper: pos.tickUpper };
+            }
+            await this.closePosition(pos);
+            return this.mint();
+        }
+        catch (e) {
+            return { ok: false, error: e?.shortMessage || e?.message || String(e) };
+        }
+    }
+    async closePosition(pos) {
+        const pm = chains_2.ADDRESSES[this.chainId]?.uniV3PositionManager;
+        const max = 2n ** 128n - 1n;
+        const deadline = BigInt(Math.floor(Date.now() / 1000) + 600);
+        try {
+            await this.wallet.writeContract({
+                address: pm, abi: NFPM_ABI, functionName: "collect",
+                args: [{ tokenId: BigInt(pos.tokenId), recipient: this.account.address, amount0Max: max, amount1Max: max }],
+            });
+        }
+        catch { }
+        if (BigInt(pos.liquidity) > 0n) {
+            await this.wallet.writeContract({
+                address: pm, abi: NFPM_ABI, functionName: "decreaseLiquidity",
+                args: [{ tokenId: BigInt(pos.tokenId), liquidity: BigInt(pos.liquidity), amount0Min: 0n, amount1Min: 0n, deadline }],
+            });
+            await this.wallet.writeContract({
+                address: pm, abi: NFPM_ABI, functionName: "collect",
+                args: [{ tokenId: BigInt(pos.tokenId), recipient: this.account.address, amount0Max: max, amount1Max: max }],
+            });
+        }
+    }
+    // ======================= Cron =======================
+    async autoRebalance() {
+        if (!this.enabled)
+            return;
+        if (Date.now() - this.lastRun < 200000)
+            return;
+        this.lastRun = Date.now();
+        const r = await this.rebalance();
+        if (r && (r.error || r.rebalanced === true)) {
+            this.logger.log(`MM: ${JSON.stringify(r).slice(0, 200)}`);
+        }
+    }
+};
+exports.MarketMakerService = MarketMakerService;
+__decorate([
+    (0, schedule_1.Cron)("*/300 * * * * *"),
+    __metadata("design:type", Function),
+    __metadata("design:paramtypes", []),
+    __metadata("design:returntype", Promise)
+], MarketMakerService.prototype, "autoRebalance", null);
+exports.MarketMakerService = MarketMakerService = MarketMakerService_1 = __decorate([
+    (0, common_1.Injectable)(),
+    __metadata("design:paramtypes", [])
+], MarketMakerService);
+
+
+/***/ }),
+/* 37 */
+/***/ (function(__unused_webpack_module, exports, __webpack_require__) {
+
+
+var __decorate = (this && this.__decorate) || function (decorators, target, key, desc) {
+    var c = arguments.length, r = c < 3 ? target : desc === null ? desc = Object.getOwnPropertyDescriptor(target, key) : desc, d;
+    if (typeof Reflect === "object" && typeof Reflect.decorate === "function") r = Reflect.decorate(decorators, target, key, desc);
+    else for (var i = decorators.length - 1; i >= 0; i--) if (d = decorators[i]) r = (c < 3 ? d(r) : c > 3 ? d(target, key, r) : d(target, key)) || r;
+    return c > 3 && r && Object.defineProperty(target, key, r), r;
+};
+var __metadata = (this && this.__metadata) || function (k, v) {
+    if (typeof Reflect === "object" && typeof Reflect.metadata === "function") return Reflect.metadata(k, v);
+};
+var _a;
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.MarketMakerController = void 0;
+const common_1 = __webpack_require__(3);
+const mm_service_1 = __webpack_require__(36);
+let MarketMakerController = class MarketMakerController {
+    mm;
+    constructor(mm) {
+        this.mm = mm;
+    }
+    async status() {
+        return this.mm.status();
+    }
+    async mint() {
+        return this.mm.mint();
+    }
+    async rebalance() {
+        return this.mm.rebalance();
+    }
+};
+exports.MarketMakerController = MarketMakerController;
+__decorate([
+    (0, common_1.Get)("status"),
+    __metadata("design:type", Function),
+    __metadata("design:paramtypes", []),
+    __metadata("design:returntype", Promise)
+], MarketMakerController.prototype, "status", null);
+__decorate([
+    (0, common_1.Post)("mint"),
+    (0, common_1.HttpCode)(200),
+    __metadata("design:type", Function),
+    __metadata("design:paramtypes", []),
+    __metadata("design:returntype", Promise)
+], MarketMakerController.prototype, "mint", null);
+__decorate([
+    (0, common_1.Post)("rebalance"),
+    (0, common_1.HttpCode)(200),
+    __metadata("design:type", Function),
+    __metadata("design:paramtypes", []),
+    __metadata("design:returntype", Promise)
+], MarketMakerController.prototype, "rebalance", null);
+exports.MarketMakerController = MarketMakerController = __decorate([
+    (0, common_1.Controller)("api/v1/mm"),
+    __metadata("design:paramtypes", [typeof (_a = typeof mm_service_1.MarketMakerService !== "undefined" && mm_service_1.MarketMakerService) === "function" ? _a : Object])
+], MarketMakerController);
+
+
+/***/ }),
+/* 38 */
+/***/ (function(__unused_webpack_module, exports, __webpack_require__) {
+
+
+var __decorate = (this && this.__decorate) || function (decorators, target, key, desc) {
+    var c = arguments.length, r = c < 3 ? target : desc === null ? desc = Object.getOwnPropertyDescriptor(target, key) : desc, d;
+    if (typeof Reflect === "object" && typeof Reflect.decorate === "function") r = Reflect.decorate(decorators, target, key, desc);
+    else for (var i = decorators.length - 1; i >= 0; i--) if (d = decorators[i]) r = (c < 3 ? d(r) : c > 3 ? d(target, key, r) : d(target, key)) || r;
+    return c > 3 && r && Object.defineProperty(target, key, r), r;
+};
+var __metadata = (this && this.__metadata) || function (k, v) {
+    if (typeof Reflect === "object" && typeof Reflect.metadata === "function") return Reflect.metadata(k, v);
+};
+var _a;
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.AgentsController = void 0;
+const common_1 = __webpack_require__(3);
+const market_service_1 = __webpack_require__(8);
+let AgentsController = class AgentsController {
+    marketService;
+    constructor(marketService) {
+        this.marketService = marketService;
+    }
+    async stats() {
+        const result = await this.marketService.list({ limit: 500 });
+        const pairs = [];
+        for (const m of result.items) {
+            if (m.chainId !== 8453)
+                continue; // Base only (AI agents run on Base)
+            let volume = 0;
+            try {
+                const ticker = await this.marketService.getTicker(m.marketId);
+                volume = parseFloat(ticker?.volume24hBase || "0");
+            }
+            catch { }
+            pairs.push({
+                marketId: m.marketId,
+                base: m.baseSymbol || m.token0Symbol || "?",
+                quote: m.quoteSymbol || m.token1Symbol || "?",
+                activeAgents: 0, // TODO: read from vault contract when agents launch
+                totalBalance: 0, // TODO: sum of agents' deposits in vault
+                incomeDay: 0, // TODO: aggregate agents' 24h PnL
+                incomeMonth: 0, // TODO: aggregate agents' 30d PnL
+                status: volume > 0 ? "active" : "no_trades",
+                robots: 0, // TODO: read from robot registry (API robots)
+            });
+        }
+        return { pairs };
+    }
+};
+exports.AgentsController = AgentsController;
+__decorate([
+    (0, common_1.Get)("stats"),
+    __metadata("design:type", Function),
+    __metadata("design:paramtypes", []),
+    __metadata("design:returntype", Promise)
+], AgentsController.prototype, "stats", null);
+exports.AgentsController = AgentsController = __decorate([
+    (0, common_1.Controller)("api/v1/agents"),
+    __metadata("design:paramtypes", [typeof (_a = typeof market_service_1.MarketService !== "undefined" && market_service_1.MarketService) === "function" ? _a : Object])
+], AgentsController);
 
 
 /***/ })
